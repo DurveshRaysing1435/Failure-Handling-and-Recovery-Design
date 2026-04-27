@@ -64,22 +64,6 @@ The heart of this system. Completely decoupled from the main assessment engine, 
 | `UIResponseSchema` | Pydantic Model | Formats fallback text and action commands returned to the frontend |
 | `FailureHandler` | Class | Tracks per-session retry state and executes the correct recovery strategy |
 
-#### Recovery Strategies
-
-**`handle_user_silence()`**
-```
-Attempt 1 → Prompt candidate to respond
-Attempt 2 → Re-prompt with a reminder
-Attempt 3 → Skip question, award 0 points, advance session
-```
-
-**`handle_llm_timeout()`**
-```
-Attempt 1 → Retry after 2s  (exponential backoff)
-Attempt 2 → Retry after 4s  (exponential backoff)
-Attempt 3 → Gracefully abort LLM call, skip question, advance session
-```
-
 ---
 
 ### `main.py` — FastAPI Integration Layer
@@ -95,6 +79,60 @@ POST /api/evaluate_answer
 | `session_id` | `string` | Candidate session identifier |
 | `answer_text` | `string` | The candidate's submitted answer |
 | `simulate_timeout` | `boolean` | Forces LLM timeout simulation when `true` |
+
+---
+
+## 🔄 Failure Flow Diagrams
+
+### 1. User-Side Failure — Candidate Silence 🤐
+
+Triggered when the microphone is active but no speech is detected. The system re-prompts the candidate up to twice before gracefully skipping the question.
+
+```mermaid
+graph TD
+    A[Start: Await Audio Input] --> B{Speech Detected?}
+    B -- Yes --> C[Process Answer & Validate]
+    B -- No --> D{Check Retry Count}
+
+    D -- Count = 0 --> E[Increment Count: +1]
+    E --> F[Trigger TTS: 'I didn't quite catch that.']
+    F --> A
+
+    D -- Count = 1 --> G[Increment Count: +1]
+    G --> H[Trigger TTS: 'Still not hearing anything. Final warning.']
+    H --> A
+
+    D -- Count = 2 --> I[Log Failure: user_silence_timeout]
+    I --> J[Trigger TTS: 'Let's move to the next question.']
+    J --> K[Assign 0 Points & Skip Question]
+    K --> L[Load Next Question]
+```
+
+---
+
+### 2. System-Side Failure — LLM Timeout & API Error ⏱️
+
+Triggered when the Generative AI engine fails to respond within the threshold. Applies exponential backoff before gracefully aborting and queuing the evaluation.
+
+```mermaid
+graph TD
+    A[Start: Send Prompt to LLM] --> B{Response Received < 10s?}
+    B -- Yes --> C[Validate JSON Schema]
+    C -- Valid --> D[Return Output to UI]
+    C -- Invalid --> E[Treat as API Failure]
+
+    B -- No Timeout --> F{Check Retry Count}
+    E --> F
+
+    F -- Count < 2 --> G[Increment Count]
+    G --> H[Apply Exponential Backoff: Wait 2s/4s]
+    H --> A
+
+    F -- Count = 2 --> I[Log Error to DB: llm_critical_timeout]
+    I --> J[Trigger Fallback: 'Experiencing network delay.']
+    J --> K[Skip Evaluation for Now / Queue for Later]
+    K --> L[Proceed to Next Question]
+```
 
 ---
 
@@ -135,8 +173,6 @@ FastAPI provides a built-in interactive UI — no frontend or Postman required.
 
 ### Test Case 1 — User Silence 🤐
 
-Simulates a candidate who submits an empty answer repeatedly.
-
 | Field | Value |
 |---|---|
 | `session_id` | `cand_123` |
@@ -145,14 +181,12 @@ Simulates a candidate who submits an empty answer repeatedly.
 
 **Expected behavior:**
 - **Click 1:** System prompts the candidate to speak
-- **Click 2:** System re-prompts with a reminder
+- **Click 2:** System re-prompts with a final warning
 - **Click 3:** Retry limit hit → question skipped with **0 points**
 
 ---
 
 ### Test Case 2 — LLM Timeout & Exponential Backoff ⏱️
-
-Simulates an AI API that repeatedly fails to respond.
 
 | Field | Value |
 |---|---|
